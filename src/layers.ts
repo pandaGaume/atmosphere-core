@@ -12,10 +12,10 @@ export interface ILayerProfile {
     /** Geodetic upper boundary, exclusive, metres. */
     readonly topAltitudeMeters: number;
     /** Analytic density model supported by CPU and laboratory GPU. */
-    readonly kind: "exponential" | "constant" | "gaussian";
+    readonly kind: "exponential" | "constant" | "gaussian" | "tent";
     /** Height where the multiplier equals densityScale, metres. */
     readonly referenceAltitudeMeters: number;
-    /** Exponential scale height or Gaussian standard deviation, metres. */
+    /** Exponential scale height, Gaussian standard deviation or tent half-width, metres. */
     readonly scaleHeightMeters: number;
     /** Nonnegative density multiplier at the reference height. */
     readonly densityScale: number;
@@ -36,13 +36,15 @@ export interface IAtmosphereLayer {
     /** Unique stable identifier within its atmosphere. */
     readonly id: string;
     /** Descriptive layer category, not an imposed display color. */
-    readonly kind: "gas" | "aerosol";
+    readonly kind: "gas" | "aerosol" | "absorption";
     /** Analytic density support and shape. */
     readonly profile: ILayerProfile;
     /** Optional layer-local gas composition and thermodynamic state. */
     readonly gas?: Readonly<IGasLayerState>;
     /** Optional layer-local particulate state. */
     readonly aerosol?: Readonly<IAerosolLayerState>;
+    /** Optional wavelength-dependent absorbing medium. */
+    readonly absorption?: Readonly<IAbsorptionLayerState>;
     /** Returns optical coefficients at a wavelength in nanometres. */
     optics(wavelengthNm: number): ILayerOptics;
 }
@@ -66,18 +68,27 @@ export interface IAerosolLayerState extends IDustOptions {
     /** Structural particulate metadata from a composition or physics catalog. */
     readonly particulate?: IParticulateMetadata;
 }
+/** Spectral absorption cross sections at a stated reference particle density. */
+export interface IAbsorptionLayerState {
+    /** Reference molecular number density, per cubic metre. */
+    readonly numberDensityPerM3: number;
+    /** Strictly increasing [wavelength in nm, cross section in square metres] samples. Linear interpolation; zero outside support. */
+    readonly crossSections: readonly (readonly [number, number])[];
+}
 /** Serializable layer definition consumed by the laboratory editor and factories. */
 export interface IAtmosphereLayerDefinition {
     /** Layer identifier. */
     readonly id: string;
     /** Gas or particulate medium. */
-    readonly kind: "gas" | "aerosol";
+    readonly kind: "gas" | "aerosol" | "absorption";
     /** Vertical support and profile in geodetic metres. */
     readonly profile: ILayerProfile;
     /** Required for a gas layer. */
     readonly gas?: IGasLayerState;
     /** Required for an aerosol layer. */
     readonly aerosol?: IAerosolLayerState;
+    /** Required for an absorption-only layer. */
+    readonly absorption?: IAbsorptionLayerState;
 }
 /** Renderer-facing atmosphere contract, composed of independent layers. */
 export interface IAtmosphere extends IAtmosphericBounds {
@@ -119,7 +130,7 @@ export function copyLayerProfile(profile: ILayerProfile): Readonly<ILayerProfile
         profile.topAltitudeMeters <= profile.bottomAltitudeMeters ||
         profile.scaleHeightMeters <= 0 ||
         profile.densityScale < 0 ||
-        !["exponential", "constant", "gaussian"].includes(profile.kind)
+        !["exponential", "constant", "gaussian", "tent"].includes(profile.kind)
     )
         throw new Error("Invalid atmospheric layer profile");
     return Object.freeze({ ...profile });
@@ -128,7 +139,14 @@ export function copyLayerProfile(profile: ILayerProfile): Readonly<ILayerProfile
 export function layerDensityAtAltitude(profile: ILayerProfile, heightMeters: number): number {
     if (heightMeters < profile.bottomAltitudeMeters || heightMeters >= profile.topAltitudeMeters) return 0;
     const x = (heightMeters - profile.referenceAltitudeMeters) / profile.scaleHeightMeters;
-    return profile.densityScale * (profile.kind === "constant" ? 1 : Math.exp(profile.kind === "gaussian" ? -0.5 * x * x : -x));
+    return (
+        profile.densityScale *
+        (profile.kind === "tent"
+            ? Math.max(0, 1 - Math.abs(x))
+            : profile.kind === "constant"
+              ? 1
+              : Math.exp(profile.kind === "gaussian" ? -0.5 * x * x : -x))
+    );
 }
 /** Creates an immutable gas or aerosol layer from a serializable physical definition. */
 export function createAtmosphereLayer(definition: IAtmosphereLayerDefinition): IAtmosphereLayer {
@@ -155,6 +173,41 @@ export function createAtmosphereLayer(definition: IAtmosphereLayerDefinition): I
                     cache.set(wavelengthNm, value);
                 }
                 return value;
+            },
+        });
+    }
+    if (definition.kind === "absorption") {
+        const state = definition.absorption;
+        if (
+            !state ||
+            !Number.isFinite(state.numberDensityPerM3) ||
+            state.numberDensityPerM3 < 0 ||
+            state.crossSections.length < 2 ||
+            state.crossSections.some(
+                ([w, c], i, table) => !Number.isFinite(w) || w <= 0 || !Number.isFinite(c) || c < 0 || (i > 0 && w <= table[i - 1][0]),
+            )
+        )
+            throw new Error("Absorption layer needs a nonnegative density and increasing spectral cross sections");
+        const absorption = Object.freeze({
+            numberDensityPerM3: state.numberDensityPerM3,
+            crossSections: Object.freeze(state.crossSections.map((pair) => Object.freeze([...pair] as [number, number]))),
+        });
+        return Object.freeze({
+            id: definition.id,
+            kind: "absorption" as const,
+            profile,
+            absorption,
+            optics(wavelengthNm: number): ILayerOptics {
+                if (!Number.isFinite(wavelengthNm) || wavelengthNm <= 0) throw new Error("Invalid absorption wavelength");
+                const table = absorption.crossSections;
+                let cross = 0;
+                if (wavelengthNm >= table[0][0] && wavelengthNm <= table.at(-1)![0]) {
+                    let i = 0;
+                    while (i < table.length - 2 && table[i + 1][0] < wavelengthNm) i++;
+                    const t = (wavelengthNm - table[i][0]) / (table[i + 1][0] - table[i][0]);
+                    cross = table[i][1] * (1 - t) + table[i + 1][1] * t;
+                }
+                return Object.freeze({ rayleigh: 0, scattering: 0, extinction: cross * absorption.numberDensityPerM3, phase: () => 0 });
             },
         });
     }
@@ -276,7 +329,7 @@ export function packLayerProfiles(atmosphere: IAtmosphere): Float32Array {
                 p.referenceAltitudeMeters / 1000,
                 p.scaleHeightMeters / 1000,
                 p.densityScale,
-                p.kind === "constant" ? 1 : p.kind === "gaussian" ? 2 : 0,
+                p.kind === "constant" ? 1 : p.kind === "gaussian" ? 2 : p.kind === "tent" ? 3 : 0,
                 0,
                 0,
             ];

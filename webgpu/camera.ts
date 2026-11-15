@@ -37,7 +37,7 @@ export function copyCamera(camera: IAtmosphereCamera, axes: IEllipsoidAxes): IAt
 }
 
 /** Local tangent frame and double-precision ellipsoidal horizon at each azimuth. */
-export function horizonMetadata(axes: IEllipsoidAxes, origin: EcefVector, width: number) {
+export function horizonMetadata(axes: IEllipsoidAxes, origin: EcefVector, width: number, top = 0) {
     const geo = ecefToGeodetic(axes, { x: origin[0], y: origin[1], z: origin[2] }),
         lat = geo.latitude,
         lon = geo.longitude;
@@ -45,6 +45,7 @@ export function horizonMetadata(axes: IEllipsoidAxes, origin: EcefVector, width:
         north = [-Math.sin(lat) * Math.cos(lon), -Math.sin(lat) * Math.sin(lon), Math.cos(lat)],
         up = [Math.cos(lat) * Math.cos(lon), Math.cos(lat) * Math.sin(lon), Math.sin(lat)];
     const horizon = new Float32Array(width);
+    const upperHorizon = new Float32Array(width).fill(Math.PI / 2);
     for (let x = 0; x < width; x++) {
         const azimuth = (x / width) * 2 * Math.PI;
         let low = -Math.PI / 2,
@@ -59,8 +60,22 @@ export function horizonMetadata(axes: IEllipsoidAxes, origin: EcefVector, width:
             else high = elevation;
         }
         horizon[x] = (low + high) / 2;
+        if (top > 0 && geo.height >= top) {
+            low = -Math.PI / 2;
+            high = 0;
+            for (let k = 0; k < 48; k++) {
+                const elevation = (low + high) / 2;
+                const d = up.map(
+                    (v, i) => v * Math.sin(elevation) + Math.cos(elevation) * (Math.cos(azimuth) * east[i] + Math.sin(azimuth) * north[i]),
+                );
+                const hit = intersectEllipsoid(axes, origin, d, 1 + top / axes.semiMinorAxis);
+                if (hit && hit[0] >= 0) low = elevation;
+                else high = elevation;
+            }
+            upperHorizon[x] = (low + high) / 2;
+        }
     }
-    return { east, north, up, horizon, height: Math.max(0, geo.height) };
+    return { east, north, up, horizon, upperHorizon, height: Math.max(0, geo.height) };
 }
 
 /** Splits a CPU number into a float32 high component and its residual. */

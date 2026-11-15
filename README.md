@@ -105,3 +105,7 @@ device.queue.submit([encoder.finish()]);
 Construction is progressive and restarts the view tasks after translation. Rotation reuses the full-sky cache. Changing atmosphere, sunlight, source spectrum or quality requires a replacement instance. The WGSL reader returns scene-linear spectral sky radiance without an invented ground color, stellar disk, exposure or tone mapping. Terrain aerial perspective belongs to the next milestone.
 
 See the [integration contract](docs/WEBGPU-INTEGRATION.md), [precision protocol](docs/WEBGPU-PRECISION.md) and [standalone consumer](examples/sky-consumer/README.md). Run `npm run test:webgpu` for the packed-consumer Chrome suite. Reconstruction cost and XR frame rates are not qualified by numerical agreement.
+
+## Research records
+
+The [research catalogue](docs/research/README.md) preserves reports, requests, measurements and experimental source artifacts by procedure. The [R1.6 DEM transport comparison](docs/research/R01.6-dem-transport-ab/README.md) includes the shared-geometry A/B experiment, its results on two GPUs, converged E0 diagnostics and verified archive references. Experimental code remains under `docs/research`; this documentation update does not activate it in the production runtime.

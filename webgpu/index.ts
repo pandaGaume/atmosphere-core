@@ -1,3 +1,9 @@
+import aerialDepth from "./generated/aerial-read";
+/** Renderer-independent volume depth coordinate in WGSL. */
+export const atmosphereAerialDepthWgsl = aerialDepth;
+import { AtmosphereAerialVolume, type IAtmosphereAerialOptions } from "./aerial";
+export { AtmosphereAerialVolume } from "./aerial";
+export type { IAtmosphereAerialOptions, IAtmosphereAerialBindings } from "./aerial";
 /// <reference types="@webgpu/types" />
 import { makeSpectralScene, phaseTable, spectrumBuffer } from "../src/spectrum";
 import { copyLayerProfile, packLayerProfiles } from "../src/layers";
@@ -7,6 +13,7 @@ import geometry from "./generated/geometry";
 import transport from "./generated/transport";
 import read from "./generated/read";
 import bake from "./generated/bake";
+import multipleBake from "./generated/multiple";
 import solarBake from "./generated/solar";
 import { geodeticPosition } from "../src/geometry";
 import type { IAtmosphereCamera, IAtmosphereSkyBindings, IAtmosphereSkyOptions } from "./types";
@@ -22,6 +29,11 @@ export class AtmosphereSky {
     private solarGroups: GPUBindGroup[] = [];
     private solarUniforms: GPUBuffer[] = [];
     private solarCursor = 0;
+    private multiplePipeline!: GPUComputePipeline;
+    private multipleGroups: GPUBindGroup[] = [];
+    private multipleUniforms: GPUBuffer[] = [];
+    private multipleCursor = 0;
+    private readonly multipleScattering: boolean;
     private skyCursor = 0;
     private readonly resources: Array<GPUBuffer | GPUTexture> = [];
     private disposed = false;
@@ -62,6 +74,7 @@ export class AtmosphereSky {
         atmosphere: IAtmosphere,
         options: IAtmosphereSkyOptions,
     ) {
+        this.multipleScattering = options.multipleScattering ?? false;
         this.width = options.width ?? 64;
         this.rows = options.hemisphereRows ?? 64;
         this.viewSteps = options.viewSteps ?? 256;
@@ -132,7 +145,7 @@ export class AtmosphereSky {
             phase.width > this.device.limits.maxTextureDimension2D ||
             spectrum.byteLength > this.device.limits.maxStorageBufferBindingSize ||
             this.device.limits.maxTextureDimension3D < 64 ||
-            this.device.limits.maxSampledTexturesPerShaderStage < 4 ||
+            this.device.limits.maxSampledTexturesPerShaderStage < 5 ||
             this.device.limits.maxStorageBufferBindingSize < 2097152 ||
             this.device.limits.maxBufferSize < 2097152 ||
             this.device.limits.maxStorageTexturesPerShaderStage < 2 ||
@@ -147,13 +160,14 @@ export class AtmosphereSky {
             return this.device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint } });
         };
         this.pipeline = await compile(geometry + transport + bake, "atmosphere_bake");
+        if (this.multipleScattering) this.multiplePipeline = await compile(geometry + transport + multipleBake, "atmosphere_bakeMultiple");
         this.solarPipeline = await compile(geometry + transport + solarBake, "atmosphere_bakeSolar");
         this.device.pushErrorScope("validation");
         try {
             this.uniform = this.buffer(new Float32Array(40), GPUBufferUsage.UNIFORM);
             const profileBuffer = this.buffer(profiles, GPUBufferUsage.STORAGE),
                 spectrumBufferResource = this.buffer(spectrum, GPUBufferUsage.STORAGE);
-            this.horizonBuffer = this.buffer(new Float32Array(this.width), GPUBufferUsage.STORAGE);
+            this.horizonBuffer = this.buffer(new Float32Array(this.width * 2), GPUBufferUsage.STORAGE);
             const phaseTexture = this.device.createTexture({
                 size: [phase.width, phase.height],
                 format: "rgba32float",
@@ -186,24 +200,35 @@ export class AtmosphereSky {
             });
             this.resources.push(solarTexture);
             const points = new Float32Array(solarSize[0] * solarSize[1] * solarSize[2] * 8);
-            const declination = this.model.sun[2],
-                sunLongitude = Math.atan2(this.model.sun[1], this.model.sun[0]);
+            const sunLongitude = Math.atan2(this.model.sun[1], this.model.sun[0]);
             for (let z = 0; z < solarSize[2]; z++)
                 for (let y = 0; y < solarSize[1]; y++)
                     for (let x = 0; x < solarSize[0]; x++) {
                         const latitude = (y / (solarSize[1] - 1) - 0.5) * Math.PI;
+                        const height = this.model.top * (z / (solarSize[2] - 1)) ** 2;
+                        const meridian = geodeticPosition(this.model.ellipsoid, latitude, 0, height);
+                        const axes = [
+                            this.model.ellipsoid.semiMajorAxis,
+                            this.model.ellipsoid.semiMajorAxis,
+                            this.model.ellipsoid.semiMinorAxis,
+                        ];
+                        const q = meridian.map((v, i) => v / axes[i]);
+                        const v = this.model.sun.map((value, i) => value / axes[i]);
+                        // Concentrate columns at the actual solar tangent at this height.
+                        const tangent = -Math.sqrt(
+                            v.reduce((sum, value) => sum + value * value, 0) *
+                                Math.max(0, q.reduce((sum, value) => sum + value * value, 0) - 1),
+                        );
                         const center = Math.acos(
                             Math.max(
-                                -Math.cos(0.1),
-                                Math.min(
-                                    Math.cos(0.1),
-                                    (-Math.sin(latitude) * declination) /
-                                        Math.max(1e-8, Math.cos(latitude) * Math.sqrt(Math.max(0, 1 - declination ** 2))),
-                                ),
+                                -1.0,
+                                Math.min(1.0, (tangent - q[2] * v[2]) / Math.max(1e-20, Math.hypot(q[0], q[1]) * Math.hypot(v[0], v[1]))),
                             ),
                         );
-                        const t = (2 * x) / (solarSize[0] - 1) - 1,
-                            longitude = (t < 0 ? center * (1 - t * t) : center + (Math.PI - center) * t * t) + sunLongitude;
+                        // Shadowed rays are rejected analytically by readers. Spend all columns on lit rays,
+                        // approaching the height-dependent tangent from its illuminated side.
+                        const t = 1 - x / (solarSize[0] - 1),
+                            longitude = Math.max(0, center - 1e-7) * (1 - t * t) + sunLongitude;
                         const point = geodeticPosition(
                             this.model.ellipsoid,
                             latitude,
@@ -234,6 +259,19 @@ export class AtmosphereSky {
                     }),
                 );
             }
+            const multipleTexture = this.device.createTexture({
+                size: [32, 16, scene.groups],
+                format: "rgba16float",
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+            });
+            this.resources.push(multipleTexture);
+            const multipleView = multipleTexture.createView({ dimension: "2d-array" });
+            const multipleSampler = this.device.createSampler({
+                minFilter: "linear",
+                magFilter: "linear",
+                addressModeU: "clamp-to-edge",
+                addressModeV: "clamp-to-edge",
+            });
             const common: GPUBindGroupEntry[] = [
                 { binding: 0, resource: { buffer: this.uniform } },
                 { binding: 1, resource: { buffer: profileBuffer } },
@@ -241,7 +279,24 @@ export class AtmosphereSky {
                 { binding: 3, resource: phaseTexture.createView() },
                 { binding: 7, resource: { buffer: this.horizonBuffer } },
                 { binding: 8, resource: solarTexture.createView({ dimension: "3d" }) },
+                { binding: 9, resource: multipleView },
+                { binding: 10, resource: multipleSampler },
             ];
+            if (this.multipleScattering)
+                for (let band = 0; band < scene.groups; band++) {
+                    const uniform = this.buffer(new Float32Array(40), GPUBufferUsage.UNIFORM);
+                    this.multipleUniforms.push(uniform);
+                    this.multipleGroups.push(
+                        this.device.createBindGroup({
+                            layout: this.multiplePipeline.getBindGroupLayout(0),
+                            entries: [
+                                ...common.filter((e) => [1, 2, 8].includes(e.binding)),
+                                { binding: 0, resource: { buffer: uniform } },
+                                { binding: 4, resource: multipleView },
+                            ],
+                        }),
+                    );
+                }
             for (let band = 0; band < scene.groups * Math.ceil((this.rows * 2) / 4); band++) {
                 const bandUniform = this.buffer(new Float32Array(40), GPUBufferUsage.UNIFORM);
                 this.bandUniforms.push(bandUniform);
@@ -267,6 +322,8 @@ export class AtmosphereSky {
                     { binding: 8, visibility: all, texture: { sampleType: "unfilterable-float", viewDimension: "3d" } },
                     ...[4, 5].map((binding) => ({ binding, visibility: all, texture: { viewDimension: "2d-array" as const } })),
                     { binding: 6, visibility: all, sampler: { type: "filtering" } },
+                    { binding: 9, visibility: all, texture: { viewDimension: "2d-array" } },
+                    { binding: 10, visibility: all, sampler: { type: "filtering" } },
                 ],
             });
             const sampler = this.device.createSampler({
@@ -292,6 +349,7 @@ export class AtmosphereSky {
                 transmission,
                 solarColumns: solarTexture.createView({ dimension: "3d" }),
                 wavelengths: this.wavelengths,
+                ...(this.multipleScattering ? { multipleRadiance: multipleView } : {}),
             };
         } catch (error) {
             await this.device.popErrorScope();
@@ -299,6 +357,21 @@ export class AtmosphereSky {
         }
         const error = await this.device.popErrorScope();
         if (error) throw new Error(error.message);
+    }
+    /** Allocates finite-distance transport borrowing this sky's physical snapshot and solar LUT. */
+    public createAerialVolume(options: IAtmosphereAerialOptions = {}): Promise<AtmosphereAerialVolume> {
+        this.assertLive();
+        return AtmosphereAerialVolume.create(
+            this.device,
+            this.readers.layout,
+            (camera) => {
+                copyCamera(camera, this.model.ellipsoid);
+                if (!this.camera || camera.positionEcefMeters.some((v, i) => Math.abs(v - this.camera!.positionEcefMeters[i]) > 0.001))
+                    throw new Error("Aerial camera must match the encoded sky position");
+                return this.bindings();
+            },
+            options,
+        );
     }
     private assertLive(): void {
         if (this.disposed) throw new Error("Atmosphere sky is disposed");
@@ -311,7 +384,7 @@ export class AtmosphereSky {
         const moved = !this.camera || next.positionEcefMeters.some((v, i) => v !== this.camera!.positionEcefMeters[i]);
         this.camera = next;
         if (!moved) return;
-        const metadata = horizonMetadata(this.model.ellipsoid, next.positionEcefMeters, this.width);
+        const metadata = horizonMetadata(this.model.ellipsoid, next.positionEcefMeters, this.width, this.model.top);
         const axes = [this.model.ellipsoid.semiMajorAxis, this.model.ellipsoid.semiMajorAxis, this.model.ellipsoid.semiMinorAxis];
         const origin = axes.map((a, i) => split(next.positionEcefMeters[i] / a)),
             inverse = axes.map((a) => split(1000 / a));
@@ -335,6 +408,7 @@ export class AtmosphereSky {
             12,
         );
         frame.set(this.model.sun, 16);
+        frame[19] = this.multipleScattering ? 1 : 0;
         frame.set(metadata.east, 20);
         frame.set(metadata.north, 24);
         frame.set(metadata.up, 28);
@@ -342,7 +416,9 @@ export class AtmosphereSky {
         integers.set([this.viewSteps, this.solarSteps, metadata.height >= this.model.top ? 1 : 0, 0], 32);
         integers.set([this.width, this.rows * 2, this.wavelengths / 3, 0], 36);
         this.frame = frame;
-        this.horizon = metadata.horizon;
+        this.horizon = new Float32Array(this.width * 2);
+        this.horizon.set(metadata.horizon);
+        this.horizon.set(metadata.upperHorizon, this.width);
         this.dirty = true;
         this.skyCursor = 0;
         this.encoded = false;
@@ -381,22 +457,37 @@ export class AtmosphereSky {
             pass.end();
             maxDispatches--;
         }
-        while (maxDispatches > 0 && this.skyCursor < this.bandUniforms.length) {
-            const task = this.skyCursor++,
-                data = this.frame.slice(),
-                tiles = Math.ceil((this.rows * 2) / 4),
-                integers = new Uint32Array(data.buffer);
-            integers[39] = Math.floor(task / tiles);
-            integers[35] = (task % tiles) * 4;
+        while (maxDispatches > 0 && this.multipleCursor < this.multipleUniforms.length && this.solarCursor === this.solarUniforms.length) {
+            const band = this.multipleCursor++,
+                data = this.frame.slice();
+            new Uint32Array(data.buffer)[39] = band;
+            upload(data, this.multipleUniforms[band]);
+            const pass = encoder.beginComputePass({ label: "Atmosphere higher-order scattering" });
+            pass.setPipeline(this.multiplePipeline);
+            pass.setBindGroup(0, this.multipleGroups[band]);
+            pass.dispatchWorkgroups(4, 4, 1);
+            pass.end();
+            // Keep higher-order construction bounded even when the host requests a large budget.
+            maxDispatches = 0;
+        }
+        if (maxDispatches > 0 && this.multipleCursor === this.multipleUniforms.length && this.skyCursor < this.bandUniforms.length) {
+            const task = this.skyCursor,
+                count = Math.min(maxDispatches, this.bandUniforms.length - task),
+                data = this.frame.slice();
+            new Uint32Array(data.buffer)[39] = task;
             upload(data, this.bandUniforms[task]);
             const pass = encoder.beginComputePass({ label: "Atmosphere spectral Sky-View tile" });
             pass.setPipeline(this.pipeline);
             pass.setBindGroup(0, this.bandGroups[task]);
-            pass.dispatchWorkgroups(Math.ceil(this.width / 8), 1, 1);
+            // Independent spectral tiles share one dispatch so small moving LUTs fill the GPU.
+            pass.dispatchWorkgroups(Math.ceil(this.width / 8), 1, count);
             pass.end();
-            maxDispatches--;
+            this.skyCursor += count;
         }
-        this.encoded = this.solarCursor === this.solarUniforms.length && this.skyCursor === this.bandUniforms.length;
+        this.encoded =
+            this.solarCursor === this.solarUniforms.length &&
+            this.multipleCursor === this.multipleUniforms.length &&
+            this.skyCursor === this.bandUniforms.length;
         this.dirty = !this.encoded;
         return this.encoded;
     }

@@ -2,17 +2,18 @@
 @group(0) @binding(5) var atmosphere_transmission:texture_2d_array<f32>;
 @group(0) @binding(6) var atmosphere_sampler:sampler;
 @group(0) @binding(7) var<storage,read> atmosphere_horizon:array<f32>;
-fn atmosphere_horizonAt(u:f32)->f32 {
-    let width=arrayLength(&atmosphere_horizon); let x=fract(u)*f32(width); let left=u32(floor(x));
-    return mix(atmosphere_horizon[left%width],atmosphere_horizon[(left+1u)%width],fract(x));
+fn atmosphere_horizonPair(u:f32)->vec2f {
+    let width=arrayLength(&atmosphere_horizon)/2u;let x=fract(u)*f32(width);let left=u32(floor(x));let right=(left+1u)%width;
+    return mix(vec2f(atmosphere_horizon[left%width],atmosphere_horizon[width+left%width]),vec2f(atmosphere_horizon[right],atmosphere_horizon[width+right]),fract(x));
 }
+fn atmosphere_horizonAt(u:f32)->f32 {return atmosphere_horizonPair(u).x;}
 fn atmosphere_skyUv(d:vec3f)->vec2f {
     let azimuth=fract(atan2(dot(d,atmosphere_frame.north.xyz),dot(d,atmosphere_frame.east.xyz))/(2.0*atmosphere_PI)+1.0);
-    let elevation=atan2(dot(d,atmosphere_frame.up.xyz),length(vec2f(dot(d,atmosphere_frame.east.xyz),dot(d,atmosphere_frame.north.xyz)))); let h=atmosphere_horizonAt(azimuth);
+    let elevation=atan2(dot(d,atmosphere_frame.up.xyz),length(vec2f(dot(d,atmosphere_frame.east.xyz),dot(d,atmosphere_frame.north.xyz)))); let bounds=atmosphere_horizonPair(azimuth);let h=bounds.x;
     let hit=atmosphere_intersect(atmosphere_cameraPoint(),d,1.0); let ground=hit.x>=-1e-6 && hit.y>=0.0;
     let rows=f32(atmosphere_frame.size.y/2u);
-    let span=select(0.5*atmosphere_PI-h,h+0.5*atmosphere_PI,ground);
-    var t=sqrt(sqrt(clamp(abs(elevation-h)/max(span,1e-6),0.0,1.0)));if abs(elevation-h)<2e-7 {t=0.0;}
+    let span=select(bounds.y-h,h+0.5*atmosphere_PI,ground);
+    let fraction=clamp(abs(elevation-h)/max(span,1e-6),0.0,1.0);var t=select(sqrt(sqrt(fraction)),sqrt(fraction),atmosphere_frame.quality.z==1u && !ground);if abs(elevation-h)<2e-7 {t=0.0;}
     return vec2f(azimuth+0.5/f32(atmosphere_frame.size.x),(select(0.0,rows,ground)+t*(rows-1.0)+0.5)/f32(atmosphere_frame.size.y));
 }
 fn atmosphere_skyRadiance(directionEcef:vec3f)->vec3f {
@@ -26,4 +27,15 @@ fn atmosphere_transmittanceToSun(pRelativeToCameraMeters:vec3f,wavelengthGroup:u
     let delta=pRelativeToCameraMeters*0.001; let distance=length(delta);
     var p=atmosphere_cameraPoint(); if distance>0.0 { p=atmosphere_pointAdd(p,delta/distance,distance); }
     return atmosphere_solarDirect(p,atmosphere_spectrum[wavelengthGroup]);
+}
+
+// RGB approximation normalized to the incident spectrum's white point. Vacuum is exactly one.
+fn atmosphere_skyTransmission(directionEcef:vec3f)->vec3f {
+    let uv=atmosphere_skyUv(normalize(directionEcef));var xyz=vec3f(0.0);var white=vec3f(0.0);
+    for(var g=0u;g<arrayLength(&atmosphere_spectrum);g++) {
+        let band=atmosphere_spectrum[g];let input=band.atmosphere_solar.xyz;
+        xyz+=atmosphere_toXYZ(textureSampleLevel(atmosphere_transmission,atmosphere_sampler,uv,i32(g),0.0).xyz*input,band);
+        white+=atmosphere_toXYZ(input,band);
+    }
+    return clamp(atmosphere_xyzToRgb(xyz)/max(atmosphere_xyzToRgb(white),vec3f(1e-6)),vec3f(0.0),vec3f(1.0));
 }

@@ -46,6 +46,7 @@ function gpu() {
         createComputePipelineAsync: vi.fn(async () => ({ getBindGroupLayout: () => ({}) })),
         createBindGroup: vi.fn(() => ({})),
         createBindGroupLayout: vi.fn(() => ({})),
+        createPipelineLayout: vi.fn(() => ({})),
         createSampler: vi.fn(() => ({})),
         createBuffer: vi.fn((d: GPUBufferDescriptor) => {
             const b = {
@@ -118,6 +119,73 @@ describe("host-owned WebGPU contract", () => {
         sky.dispose();
         expect([...g.buffers, ...g.textures].every((r) => r.destroy.mock.calls.length === 1)).toBe(true);
         expect(() => sky.bindings()).toThrow(/disposed/);
+    });
+    it("batches spectral tiles without exceeding the progressive task budget", async () => {
+        const g = gpu();
+        const sky = await AtmosphereSky.create(g.device, model, { width: 8, hemisphereRows: 5, viewSteps: 8, solarSteps: 8 });
+        sky.update(camera);
+        // Solar construction consumes its existing 256 tasks first.
+        expect(sky.encode(g.encoder, 256)).toBe(false);
+        const start = g.dispatch.mock.calls.length;
+        expect(sky.encode(g.encoder, 5)).toBe(false);
+        expect(g.dispatch.mock.calls.slice(start)).toEqual([[1, 1, 5]]);
+        expect(sky.encode(g.encoder, 4096)).toBe(true);
+        expect(g.dispatch.mock.calls.at(-1)).toEqual([1, 1, 19]);
+        const uploads = g.buffers.filter((b) => b.data.byteLength === 160 && new Uint32Array(b.data)[39] === 5);
+        expect(uploads.length).toBeGreaterThan(0);
+        sky.dispose();
+    });
+    it("bounds finite-volume rebuilds and preserves its borrowed sky", async () => {
+        const g = gpu();
+        const sky = await AtmosphereSky.create(g.device, model, { width: 8, hemisphereRows: 4, viewSteps: 8, solarSteps: 8 });
+        sky.update(camera);
+        sky.encode(g.encoder, 4096);
+        const skyResources = [...g.buffers, ...g.textures];
+        const volume = await sky.createAerialVolume({ width: 8, height: 4, depth: 4 });
+        expect(() => volume.bindings()).toThrow(/Encode/);
+        const count = g.dispatch.mock.calls.length;
+        volume.encode(g.encoder, camera);
+        expect(g.dispatch).toHaveBeenCalledTimes(count + 1);
+        volume.encode(g.encoder, camera);
+        expect(g.dispatch).toHaveBeenCalledTimes(count + 1);
+        volume.encode(g.encoder, { ...camera, halfWidthTangent: 0.8 });
+        expect(g.dispatch).toHaveBeenCalledTimes(count + 2);
+        expect(() => volume.encode(g.encoder, { ...camera, positionEcefMeters: [6378140, 0, 0] })).toThrow();
+        expect(volume.bindings().dimensions).toEqual([8, 4, 4]);
+        expect(g.raw.queue.submit).not.toHaveBeenCalled();
+        volume.dispose();
+        volume.dispose();
+        expect(skyResources.every((r) => r.destroy.mock.calls.length === 0)).toBe(true);
+        expect(() => volume.bindings()).toThrow(/Encode/);
+        expect(sky.bindings()).toBeDefined();
+        sky.dispose();
+        expect([...g.buffers, ...g.textures].every((r) => r.destroy.mock.calls.length === 1)).toBe(true);
+    });
+    it("spreads higher-order startup work across encodes and never rebuilds it for camera motion", async () => {
+        const g = gpu(),
+            sky = await AtmosphereSky.create(g.device, model, {
+                multipleScattering: true,
+                width: 8,
+                hemisphereRows: 4,
+                viewSteps: 8,
+                solarSteps: 8,
+            });
+        sky.update(camera);
+        let builds = 0;
+        while (!sky.encode(g.encoder, 4096)) {
+            builds++;
+            expect(builds).toBeLessThan(16);
+        }
+        expect(builds).toBe(8);
+        const count = () => g.dispatch.mock.calls.filter((c) => c[0] === 4 && c[1] === 4).length;
+        expect(count()).toBe(8);
+        expect(sky.bindings().multipleRadiance).toBeDefined();
+        sky.update({ ...camera, positionEcefMeters: [6379140, 0, 0] });
+        expect(sky.encode(g.encoder, 4096)).toBe(true);
+        expect(count()).toBe(8);
+        expect(g.raw.queue.submit).not.toHaveBeenCalled();
+        sky.dispose();
+        expect([...g.buffers, ...g.textures].every((r) => r.destroy.mock.calls.length === 1)).toBe(true);
     });
     it("cleans partial creation and reports device loss", async () => {
         const g = gpu();

@@ -15,3 +15,7 @@ Thumbs.db
 *.tgz
 
 webgpu/generated/
+
+docs/research/
+docs/publication/
+doc/research/

@@ -27,6 +27,8 @@ export interface IAtmosphereSkyOptions extends Pick<
     IPhysicalAtmosphereConfig,
     "source" | "starTemperature" | "distanceAU" | "bandCenter" | "bandWidth" | "wavelengths"
 > {
+    /** Isotropic higher-order scattering closure, precomputed per model snapshot. Default false. No ground bounce. */
+    readonly multipleScattering?: boolean;
     /** Azimuth texels, from 8 to 1024; default 64. */
     readonly width?: number;
     /** Rows on each side of the horizon, from 4 to 256; default 64. */
@@ -50,6 +52,8 @@ export interface IAtmosphereSkyBindings {
     readonly transmission: GPUTextureView;
     /** Four layer-density columns in kilometres, rgba32float 3d; negative first component marks shadow. */
     readonly solarColumns: GPUTextureView;
+    /** Isotropic higher-order spectral radiance per incident irradiance; absent when disabled. */
+    readonly multipleRadiance?: GPUTextureView;
     /** Resolved spectral wavelength count. */
     readonly wavelengths: number;
 }

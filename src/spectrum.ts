@@ -101,6 +101,8 @@ export interface IPhysicalScene {
 }
 /** Direct CPU spectral integration quality. */
 export interface ISpectralIntegrationOptions {
+    /** Optional opaque-surface distance in metres from the eye. Zero is a vacuum-length path. */
+    maxDistanceMeters?: number;
     /** Uniform view-ray quadrature steps. */
     steps?: number;
     /** Direct solar-ray density-column steps at each view position. */
@@ -359,6 +361,7 @@ function spectralScene(
         profile: l.profile,
         ...(l.gas ? { gas: l.gas } : {}),
         ...(l.aerosol ? { aerosol: l.aerosol } : {}),
+        ...(l.absorption ? { absorption: l.absorption } : {}),
     }));
     return {
         model,
@@ -416,19 +419,25 @@ export function integrateSpectral(
     scene: IPhysicalScene,
     origin: Vector3,
     direction: Vector3,
-    { steps = 256, solarSteps = 96 }: ISpectralIntegrationOptions = {},
+    { steps = 256, solarSteps = 96, maxDistanceMeters }: ISpectralIntegrationOptions = {},
 ): ISpectralRayResult {
     if (![steps, solarSteps].every((n) => Number.isInteger(n) && n > 0)) throw new Error("Positive integer spectral step counts required");
+    if (maxDistanceMeters !== undefined && (!Number.isFinite(maxDistanceMeters) || maxDistanceMeters < 0))
+        throw new RangeError("Invalid surface distance");
     direction = normalize(direction);
     const m = scene.model,
-        interval = atmosphericInterval(m, origin, direction),
+        fullInterval = atmosphericInterval(m, origin, direction),
+        interval =
+            fullInterval && maxDistanceMeters !== undefined
+                ? { ...fullInterval, end: Math.min(fullInterval.end, maxDistanceMeters) }
+                : fullInterval,
         n = scene.bins.length,
         L = Array(n).fill(0),
         T = Array(n).fill(1);
     const mu = dot(direction, m.sun),
         phaseR = (3 * (1 + mu * mu)) / (16 * Math.PI),
         phase = scene.bins.map((b) => b.layers.map((l) => l.phase(mu)));
-    if (interval) {
+    if (interval && interval.end > interval.start) {
         const ds = (interval.end - interval.start) / steps;
         for (let i = 0; i < steps; i++) {
             const p = along(origin, direction, interval.start + (i + 0.5) * ds),

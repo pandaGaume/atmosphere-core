@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-const names = ["geometry", "transport", "read", "bake", "solar"];
+const names = ["geometry", "transport", "read", "bake", "solar", "aerial", "multiple", "aerial-read"];
 await mkdir(new URL("../webgpu/generated/", import.meta.url), { recursive: true });
 for (const name of names) {
     const source = await readFile(new URL(`../webgpu/shaders/${name}.wgsl`, import.meta.url), "utf8");

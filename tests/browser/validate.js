@@ -1,3 +1,7 @@
+import {validateOrbitalAerial} from "./orbital-aerial.js";
+import {validateAerialHorizon} from "./aerial-horizon.js";
+import {validateMultiple} from "./multiple.js";
+import { validateAerial } from "./aerial.js";
 import { AtmosphereSky, atmosphereSkyWgsl } from "@spacexr/atmosphere/webgpu";
 import * as cpu from "@spacexr/atmosphere";
 
@@ -259,6 +263,9 @@ export async function validate() {
         };
     }
     try {
+        console.log("Validating multiple scattering");
+        report.multiple=await validateMultiple(device);
+        failures.push(...report.multiple.failures);
         for (const scenario of scenarios) {
             console.log("Validating", scenario.name);
             const scene = cpu.makePhysicalScene(scenario.config, scenario.sun),
@@ -414,6 +421,12 @@ export async function validate() {
             }
         }
         await device.queue.onSubmittedWorkDone();
+        report.aerialHorizon=await validateAerialHorizon(device);
+        failures.push(...report.aerialHorizon.failures);
+        report.orbitalAerial=await validateOrbitalAerial(device);
+        failures.push(...report.orbitalAerial.failures);
+        report.aerial = await validateAerial(device);
+        failures.push(...report.aerial.failures);
         const lossCheck = await AtmosphereSky.create(device, base.model, { width: 8, hemisphereRows: 4, viewSteps: 8, solarSteps: 8 });
         device.destroy();
         await device.lost;

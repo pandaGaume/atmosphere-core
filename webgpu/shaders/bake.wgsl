@@ -3,13 +3,15 @@
 @group(0) @binding(7) var<storage,read> atmosphere_horizon:array<f32>;
 @compute @workgroup_size(8,4,1)
 fn atmosphere_bake(@builtin(global_invocation_id) invocation:vec3u) {
-    let id=vec3u(invocation.x,invocation.y+atmosphere_frame.quality.w,invocation.z);
+    let tiles=(atmosphere_frame.size.y+3u)/4u;
+    let task=atmosphere_frame.size.w+invocation.z;
+    let group=task/tiles;
+    let id=vec3u(invocation.x,invocation.y+(task%tiles)*4u,group);
     if any(id>=atmosphere_frame.size.xyz) { return; }
-    let group=atmosphere_frame.size.w;
     let rows=atmosphere_frame.size.y/2u; let ground=id.y>=rows;
     let fraction=f32(id.y%rows)/f32(rows-1u); let h=atmosphere_horizon[id.x];
-    let span=select(0.5*atmosphere_PI-h,h+0.5*atmosphere_PI,ground);
-    var elevation=h+select(1.0,-1.0,ground)*span*fraction*fraction*fraction*fraction;
+    let span=select(atmosphere_horizon[atmosphere_frame.size.x+id.x]-h,h+0.5*atmosphere_PI,ground);
+    var elevation=h+select(1.0,-1.0,ground)*span*select(fraction*fraction*fraction*fraction,fraction*fraction,atmosphere_frame.quality.z==1u && !ground);
 
     let azimuth=f32(id.x)/f32(atmosphere_frame.size.x)*2.0*atmosphere_PI;
     let direction=normalize(sin(elevation)*atmosphere_frame.up.xyz+cos(elevation)*(cos(azimuth)*atmosphere_frame.east.xyz+sin(azimuth)*atmosphere_frame.north.xyz));

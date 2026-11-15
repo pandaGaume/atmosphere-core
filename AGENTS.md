@@ -1,4 +1,4 @@
-# AGENTS.md, spacexr-atmosphere
+# AGENTS.md, atmosphere-core
 
 ## Scope
 

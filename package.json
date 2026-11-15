@@ -7,11 +7,11 @@
     "author": "Guillaume Pelletier (SpaceXR)",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/pandaGaume/spacexr-atmosphere.git"
+        "url": "git+https://github.com/pandaGaume/atmosphere-core.git"
     },
-    "homepage": "https://github.com/pandaGaume/spacexr-atmosphere#readme",
+    "homepage": "https://github.com/pandaGaume/atmosphere-core#readme",
     "bugs": {
-        "url": "https://github.com/pandaGaume/spacexr-atmosphere/issues"
+        "url": "https://github.com/pandaGaume/atmosphere-core/issues"
     },
     "keywords": [
         "atmosphere",
